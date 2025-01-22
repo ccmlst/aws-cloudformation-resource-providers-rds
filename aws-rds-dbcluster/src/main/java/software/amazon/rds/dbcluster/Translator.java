@@ -175,6 +175,36 @@ public class Translator {
                 .build();
     }
 
+    static RestoreDbClusterToPointInTimeRequest restoreLimitlessDbClusterToPointInTimeRequest(
+        final ResourceModel model,
+        final Tagging.TagSet tagSet
+    ) {
+        RestoreDbClusterToPointInTimeRequest request = restoreDbClusterToPointInTimeRequest(model, tagSet);
+        // Restore API for limitless clusters accepts PIEM params
+        return request.toBuilder()
+            .monitoringRoleArn(model.getMonitoringRoleArn())
+            .monitoringInterval(model.getMonitoringInterval())
+            .enablePerformanceInsights(model.getPerformanceInsightsEnabled())
+            .performanceInsightsRetentionPeriod(model.getPerformanceInsightsRetentionPeriod())
+            .performanceInsightsKMSKeyId(model.getPerformanceInsightsKmsKeyId())
+            .build();
+    }
+
+    static RestoreDbClusterFromSnapshotRequest restoreLimitlessDbClusterFromSnapshotRequest(
+            final ResourceModel model,
+            final Tagging.TagSet tagSet
+    ) {
+        RestoreDbClusterFromSnapshotRequest request = restoreDbClusterFromSnapshotRequest(model, tagSet);
+        // Restore API for limitless clusters accepts PIEM params
+        return request.toBuilder()
+            .monitoringRoleArn(model.getMonitoringRoleArn())
+            .monitoringInterval(model.getMonitoringInterval())
+            .enablePerformanceInsights(model.getPerformanceInsightsEnabled())
+            .performanceInsightsRetentionPeriod(model.getPerformanceInsightsRetentionPeriod())
+            .performanceInsightsKMSKeyId(model.getPerformanceInsightsKmsKeyId())
+            .build();
+    }
+
     static Long castToLong(Object object) {
         return object == null ? null : Long.parseLong(String.valueOf(object));
     }
@@ -252,6 +282,22 @@ public class Translator {
         }
 
         return builder.build();
+    }
+
+    // params that are acked by Restore but
+    // not allowed in ModifyDBCluster for limitless usecase should not be passed
+    // https://code.amazon.com/packages/RDSCoralService/blobs/3edd6c5f4e19bd529e30199c7803905b6dc937e5/--/main/java/amazon/rds/admin/service/KermitClusterValidatorImpl.java#L181
+    static ModifyDbClusterRequest modifyLimitlessDbClusterAfterCreateRequest(final ResourceModel desiredModel) {
+        ModifyDbClusterRequest modifyDbClusterRequest = modifyDbClusterAfterCreateRequest(desiredModel);
+        return modifyDbClusterRequest.toBuilder()
+                .storageType(null)
+                .port(null)
+                .vpcSecurityGroupIds((Collection<String>) null)
+                .engineVersion(null)
+                .enablePerformanceInsights(null)
+                .performanceInsightsKMSKeyId(null)
+                .cloudwatchLogsExportConfiguration((CloudwatchLogsExportConfiguration) null)
+                .build();
     }
 
     static ModifyDbClusterRequest modifyDbClusterRequest(

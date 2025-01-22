@@ -2,14 +2,19 @@ package software.amazon.rds.dbcluster;
 
 import java.time.Instant;
 import java.util.HashSet;
+import java.util.Optional;
 
 import org.apache.commons.lang3.BooleanUtils;
 
 import com.amazonaws.util.StringUtils;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.rds.RdsClient;
+import software.amazon.awssdk.services.rds.model.DBCluster;
+import software.amazon.awssdk.services.rds.model.DBClusterSnapshot;
+import software.amazon.awssdk.services.rds.model.DBSnapshot;
 import software.amazon.awssdk.services.rds.model.SourceType;
 import software.amazon.cloudformation.proxy.AmazonWebServicesClientProxy;
+import software.amazon.cloudformation.proxy.CallChain;
 import software.amazon.cloudformation.proxy.ProgressEvent;
 import software.amazon.cloudformation.proxy.ProxyClient;
 import software.amazon.cloudformation.proxy.ResourceHandlerRequest;
@@ -21,8 +26,17 @@ import software.amazon.rds.common.request.RequestValidationException;
 import software.amazon.rds.common.request.ValidatedRequest;
 import software.amazon.rds.common.request.Validations;
 import software.amazon.rds.common.util.IdentifierFactory;
+import software.amazon.rds.common.validation.ValidationUtils;
 
 public class CreateHandler extends BaseHandlerStd {
+
+    private static String DB_CLUSTER_STORAGE_ENC_NO_KMS_VALIDATION_MSG = "You can't create an encrypted DB cluster from an unencrypted DB snapshot without an AWS KMS key. " +
+        "Specify a valid KMS key ID for encryption, then try again. To use the default key, specify 'alias/aws/rds'.";
+    private static String DB_CLUSTER_RESTORE_ENC_NO_STORAGE_ENC_PROPERTY_VALIDATION_MSG = "Encryption must be enabled when restoring a DB cluster snapshot. " +
+        "Either enable encryption or remove the encryption parameter from the template.";
+    private static String DB_CLUSTER_KMS_KEY_NO_STORAGE_ENC_VALIDATION_MSG = "If you specify an AWS KMS key when restoring a DB snapshot, encryption must enabled. " +
+        "Either enable encryption or remove the encryption parameter from the template.";
+    public final static String DB_CLUSTER_VALIDATION_MISSING_PERMISSIONS_METRIC = "DBClusterValidationMissingPermissions";
 
     private static final IdentifierFactory dbClusterIdentifierFactory = new IdentifierFactory(
             STACK_NAME,
@@ -44,6 +58,7 @@ public class CreateHandler extends BaseHandlerStd {
     protected void validateRequest(final ResourceHandlerRequest<ResourceModel> request) throws RequestValidationException {
         super.validateRequest(request);
         Validations.validateTimestamp(request.getDesiredResourceState().getRestoreToTime());
+        ClusterScalabilityTypeValidator.validateRequest(request.getDesiredResourceState());
     }
 
     @Override
@@ -70,11 +85,22 @@ public class CreateHandler extends BaseHandlerStd {
                 .resourceTags(new HashSet<>(Translator.translateTagsToSdk(request.getDesiredResourceState().getTags())))
                 .build();
 
+        if(ResourceModelHelper.isRestoreFromSnapshot(model)) {
+            ClusterScalabilityType clusterScalabilityType = getClusterScalabilityTypeFromSnapshot(rdsProxyClient, model);
+            callbackContext.setClusterScalabilityType(clusterScalabilityType);
+        }
+        if(ResourceModelHelper.isRestoreToPointInTime(model)) {
+            ClusterScalabilityType clusterScalabilityType = getClusterScalabilityTypeFromSourceDBCluster(extractAwsAccountId(request), rdsProxyClient, model);
+            callbackContext.setClusterScalabilityType(clusterScalabilityType);
+        }
+
         return ProgressEvent.progress(model, callbackContext)
                 .then(progress -> {
                     if (isRestoreToPointInTime(model)) {
+                        validateRestoreDBClusterToPointInTime(extractAwsAccountId(request), rdsProxyClient, model);
                         return Tagging.createWithTaggingFallback(proxy, rdsProxyClient, this::restoreDbClusterToPointInTime, progress, allTags);
                     } else if (isRestoreFromSnapshot(model)) {
+                        validateRestoreDBClusterFromSnapshot(extractAwsAccountId(request), rdsProxyClient, model);
                         return Tagging.createWithTaggingFallback(proxy, rdsProxyClient, this::restoreDbClusterFromSnapshot, progress, allTags);
                     }
                     return Tagging.createWithTaggingFallback(proxy, rdsProxyClient, this::createDbCluster, progress, allTags);
@@ -87,14 +113,14 @@ public class CreateHandler extends BaseHandlerStd {
                     return updateTags(proxy, rdsProxyClient, progress, Tagging.TagSet.emptySet(), extraTags);
                 }, CallbackContext::isAddTagsComplete, CallbackContext::setAddTagsComplete))
                 .then(progress -> {
-                    if (shouldUpdateAfterCreate(progress.getResourceModel())) {
+                    if (ResourceModelHelper.shouldUpdateAfterCreate(progress.getResourceModel())) {
                         return Commons.execOnce(
                                 progress,
                                 () -> {
                                     progress.getCallbackContext().timestampOnce(RESOURCE_UPDATED_AT, Instant.now());
                                     return modifyDBCluster(proxy, rdsProxyClient, progress)
                                             .then(p -> {
-                                                if (shouldEnableHttpEndpointV2AfterCreate(progress.getResourceModel())) {
+                                                if (ResourceModelHelper.shouldEnableHttpEndpointV2AfterCreate(progress.getResourceModel())) {
                                                     return enableHttpEndpointV2(proxy, rdsProxyClient, progress);
                                                 }
                                                 return p;
@@ -159,9 +185,14 @@ public class CreateHandler extends BaseHandlerStd {
             final ProgressEvent<ResourceModel, CallbackContext> progress,
             final Tagging.TagSet tagSet
     ) {
-        return proxy.initiate("rds::restore-dbcluster-to-point-in-time", proxyClient, progress.getResourceModel(), progress.getCallbackContext())
-                .translateToServiceRequest(model -> Translator.restoreDbClusterToPointInTimeRequest(model, tagSet))
-                .backoffDelay(config.getBackoff())
+        CallChain.RequestMaker<RdsClient, ResourceModel, CallbackContext> requestMaker = proxy.initiate("rds::restore-dbcluster-to-point-in-time", proxyClient, progress.getResourceModel(), progress.getCallbackContext());
+        CallChain.Caller<RestoreDbClusterToPointInTimeRequest, RdsClient, ResourceModel, CallbackContext> caller = null;
+        if(progress.getCallbackContext().getClusterScalabilityType().equals(ClusterScalabilityType.LIMITLESS)) {
+            caller = requestMaker.translateToServiceRequest(model -> Translator.restoreLimitlessDbClusterToPointInTimeRequest(model, tagSet));
+        } else {
+            caller = requestMaker.translateToServiceRequest(model -> Translator.restoreDbClusterToPointInTimeRequest(model, tagSet));
+        }
+        return caller.backoffDelay(config.getBackoff())
                 .makeServiceCall((dbClusterRequest, proxyInvocation) -> proxyInvocation.injectCredentialsAndInvokeV2(
                         dbClusterRequest,
                         proxyInvocation.client()::restoreDBClusterToPointInTime
@@ -184,9 +215,15 @@ public class CreateHandler extends BaseHandlerStd {
             final ProgressEvent<ResourceModel, CallbackContext> progress,
             final Tagging.TagSet tagSet
     ) {
-        return proxy.initiate("rds::restore-dbcluster-from-snapshot", proxyClient, progress.getResourceModel(), progress.getCallbackContext())
-                .translateToServiceRequest(model -> Translator.restoreDbClusterFromSnapshotRequest(model, tagSet))
-                .backoffDelay(config.getBackoff())
+        CallChain.RequestMaker<RdsClient, ResourceModel ,CallbackContext> requestMaker = proxy.initiate("rds::restore-dbcluster-from-snapshot", proxyClient, progress.getResourceModel(), progress.getCallbackContext());
+        CallChain.Caller<RestoreDbClusterFromSnapshotRequest, RdsClient, ResourceModel, CallbackContext> caller = null;
+        if(progress.getCallbackContext().getClusterScalabilityType().equals(ClusterScalabilityType.LIMITLESS)) {
+            caller = requestMaker.translateToServiceRequest(model -> Translator.restoreLimitlessDbClusterFromSnapshotRequest(model, tagSet));
+        } else {
+            caller = requestMaker.translateToServiceRequest(model -> Translator.restoreDbClusterFromSnapshotRequest(model, tagSet));
+        }
+
+        return caller.backoffDelay(config.getBackoff())
                 .makeServiceCall((dbClusterRequest, proxyInvocation) -> proxyInvocation.injectCredentialsAndInvokeV2(
                         dbClusterRequest,
                         proxyInvocation.client()::restoreDBClusterFromSnapshot
@@ -208,9 +245,18 @@ public class CreateHandler extends BaseHandlerStd {
             final ProxyClient<RdsClient> proxyClient,
             final ProgressEvent<ResourceModel, CallbackContext> progress
     ) {
-        return proxy.initiate("rds::modify-dbcluster", proxyClient, progress.getResourceModel(), progress.getCallbackContext())
-                .translateToServiceRequest(Translator::modifyDbClusterAfterCreateRequest)
-                .backoffDelay(config.getBackoff())
+        ClusterScalabilityType clusterScalabilityType = progress.getCallbackContext().getClusterScalabilityType();
+        CallChain.RequestMaker<RdsClient, ResourceModel, CallbackContext> callContext = proxy.initiate("rds::modify-dbcluster", proxyClient, progress.getResourceModel(), progress.getCallbackContext());
+        CallChain.Caller<ModifyDbClusterRequest, RdsClient, ResourceModel, CallbackContext> caller = null;
+
+        if (clusterScalabilityType.equals(ClusterScalabilityType.LIMITLESS)) {
+            caller = callContext.translateToServiceRequest(Translator::modifyLimitlessDbClusterAfterCreateRequest);
+        }
+        else {
+            caller = callContext.translateToServiceRequest(Translator::modifyDbClusterAfterCreateRequest);
+        }
+
+        return caller.backoffDelay(config.getBackoff())
                 .makeServiceCall((dbClusterModifyRequest, proxyInvocation) -> proxyInvocation.injectCredentialsAndInvokeV2(
                         dbClusterModifyRequest,
                         proxyInvocation.client()::modifyDBCluster
@@ -240,6 +286,124 @@ public class CreateHandler extends BaseHandlerStd {
     }
 
     private boolean shouldEnableHttpEndpointV2AfterCreate(final ResourceModel model) {
-        return BooleanUtils.isTrue(model.getEnableHttpEndpoint()) && !EngineMode.Serverless.equals(EngineMode.fromString(model.getEngineMode()))  ;
+        return BooleanUtils.isTrue(model.getEnableHttpEndpoint()) && !EngineMode.Serverless.equals(EngineMode.fromString(model.getEngineMode()));
+    }
+
+    private String extractAwsAccountId(ValidatedRequest<ResourceModel> request) {
+        if (request != null && StringUtils.hasValue(request.getAwsAccountId())) {
+            return request.getAwsAccountId();
+        }
+        return null;
+    }
+
+    private void validateRestoreDBClusterToPointInTime(final String awsAccountId,
+                                                       final ProxyClient<RdsClient> rdsProxyClient,
+                                                       final ResourceModel desiredModel
+    ) {
+        try {
+            final DBCluster dbCluster = ValidationUtils.fetchResourceForValidation(() -> fetchSourceDBCluster(awsAccountId, rdsProxyClient, desiredModel), "DescribeDBCluster");
+            final Boolean physicalStorageEncrypted = dbCluster.storageEncrypted();
+            final Boolean desiredStorageEncrypted = desiredModel.getStorageEncrypted();
+            final String desiredKMSKey = desiredModel.getKmsKeyId();
+            validateStorageEncryption(physicalStorageEncrypted, desiredStorageEncrypted, desiredKMSKey, awsAccountId);
+        } catch (ValidationAccessException ex) {
+            ValidationUtils.emitMetric(requestLogger, DB_CLUSTER_VALIDATION_MISSING_PERMISSIONS_METRIC, ex);
+        }
+    }
+
+    private Boolean getStorageEncryptedStateFromSnapshot(final ProxyClient<RdsClient> rdsProxyClient,
+                                                         final ResourceModel desiredModel) throws ValidationAccessException {
+        // Source SnapshotIdentifier might belong to either DBClusterSnapshot or DBSnapshot.
+        // Instance snapshot must use ARN format. If the format is not an ARN, treat this as a cluster snapshot
+
+        if (ArnHelper.isValidArn(desiredModel.getSnapshotIdentifier())
+                && (ArnHelper.getResourceType(desiredModel.getSnapshotIdentifier()) == ArnHelper.ResourceType.DB_INSTANCE_SNAPSHOT)) {
+            final DBSnapshot dbSnapshot = ValidationUtils.fetchResourceForValidation(() ->
+                    fetchDBSnapshot(rdsProxyClient, desiredModel), "DescribeDbSnapshots");
+            return dbSnapshot.encrypted();
+        }
+
+        final DBClusterSnapshot dbClusterSnapshot = ValidationUtils.fetchResourceForValidation(() ->
+                fetchDBClusterSnapshot(rdsProxyClient, desiredModel), "DescribeDBClusterSnapshots");
+        return dbClusterSnapshot.storageEncrypted();
+    }
+
+    private void validateRestoreDBClusterFromSnapshot(final String awsAccountId,
+                                                      final ProxyClient<RdsClient> rdsProxyClient,
+                                                      final ResourceModel desiredModel
+    ) {
+        try {
+            final Boolean physicalStorageEncrypted = getStorageEncryptedStateFromSnapshot(rdsProxyClient, desiredModel);
+            final Boolean desiredStorageEncrypted = desiredModel.getStorageEncrypted();
+            final String desiredKMSKey = desiredModel.getKmsKeyId();
+            validateStorageEncryption(physicalStorageEncrypted, desiredStorageEncrypted, desiredKMSKey, awsAccountId);
+        } catch (ValidationAccessException ex) {
+            ValidationUtils.emitMetric(requestLogger, DB_CLUSTER_VALIDATION_MISSING_PERMISSIONS_METRIC, ex);
+        }
+    }
+
+    private static void validateStorageEncryption(final Boolean physicalStorageEncrypted,
+                                                  final Boolean desiredStorageEncrypted,
+                                                  final String desiredKMSKey,
+                                                  final String awsAccountId) {
+        if (FeatureAccessControl.isAccountAllowedForFeature(FeatureAccessControl.DB_CLUSTER_RESOURCE,
+                                                            FeatureAccessControl.DB_CLUSTER_SKIP_STORAGE_ENCRYPTION_VALIDATION,
+                                                            awsAccountId)) {
+            return;
+        }
+        validateStorageEncryption(physicalStorageEncrypted, desiredStorageEncrypted, desiredKMSKey);
+    }
+
+    private static void validateStorageEncryption(final Boolean physicalStorageEncrypted,
+                                                  final Boolean desiredStorageEncrypted,
+                                                  final String desiredKMSKey) {
+
+        if (isOptingIntoEncryption(physicalStorageEncrypted, desiredStorageEncrypted)) {
+            if (StringUtils.isNullOrEmpty(desiredKMSKey)) {
+                throw new CfnInvalidRequestException(DB_CLUSTER_STORAGE_ENC_NO_KMS_VALIDATION_MSG);
+            }
+        }
+
+        if (isOptingOutOfEncryption(physicalStorageEncrypted, desiredStorageEncrypted)) {
+            throw new CfnInvalidRequestException(DB_CLUSTER_RESTORE_ENC_NO_STORAGE_ENC_PROPERTY_VALIDATION_MSG);
+        }
+
+        //Added validation as RestoreDbClusterToPointInTime/RestoreFromDBClusterSnapshot are supporting KMS Key
+        //encryption but not supporting StorageEncrypted flag.
+        if (BooleanUtils.isFalse(desiredStorageEncrypted) && StringUtils.hasValue(desiredKMSKey)) {
+            throw new CfnInvalidRequestException(DB_CLUSTER_KMS_KEY_NO_STORAGE_ENC_VALIDATION_MSG);
+        }
+    }
+
+    private static boolean isOptingIntoEncryption(final Boolean physicalStorageEncrypted,
+                                                  final Boolean desiredStorageEncrypted) {
+        return BooleanUtils.isFalse(physicalStorageEncrypted) && BooleanUtils.isTrue(desiredStorageEncrypted);
+    }
+
+    private static boolean isOptingOutOfEncryption(final Boolean physicalStorageEncrypted,
+                                                   final Boolean desiredStorageEncrypted) {
+        return BooleanUtils.isTrue(physicalStorageEncrypted) &&
+                BooleanUtils.isFalse(desiredStorageEncrypted);
+    }
+
+    protected ClusterScalabilityType getClusterScalabilityTypeFromSnapshot(final ProxyClient<RdsClient> rdsProxyClient, final ResourceModel resourceModel) {
+        DBClusterSnapshot snapshot = fetchDBClusterSnapshot(rdsProxyClient, resourceModel);
+        String snapshotEngineVersion = snapshot.engineVersion();
+
+        if (StringUtils.isNullOrEmpty(snapshotEngineVersion)) {
+            return ClusterScalabilityType.STANDARD;
+        }
+        // we are using the engine version suffix until clusterScalabilityType is returned as part of describe snapshot API - https://jira.rds.a2z.com/browse/KER-23223
+        String[] snapshotEngineVersionParts = snapshotEngineVersion.split(ENGINE_VERSION_SEPERATOR);
+        if(snapshotEngineVersionParts.length > 1 && snapshotEngineVersionParts[1].equals(LIMITLESS_ENGINE_VERSION_SUFFIX)) {
+            return ClusterScalabilityType.LIMITLESS;
+        }
+
+        return ClusterScalabilityType.STANDARD;
+    }
+
+    protected ClusterScalabilityType getClusterScalabilityTypeFromSourceDBCluster(final String AwsAccountId, final ProxyClient<RdsClient> rdsProxyClient, final ResourceModel resourceModel) {
+        DBCluster cluster = fetchSourceDBCluster(AwsAccountId, rdsProxyClient, resourceModel);
+        return cluster.clusterScalabilityType() != null ? cluster.clusterScalabilityType() : ClusterScalabilityType.STANDARD;
     }
 }
