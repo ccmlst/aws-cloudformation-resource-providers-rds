@@ -412,7 +412,7 @@ public class Translator {
     ) {
         final ModifyDbInstanceRequest.Builder builder = ModifyDbInstanceRequest.builder()
                 .allowMajorVersionUpgrade(desiredModel.getAllowMajorVersionUpgrade())
-                .applyImmediately(Boolean.TRUE)
+                .applyImmediately(ResourceModelHelper.shouldApplyImmediately(desiredModel))
                 .autoMinorVersionUpgrade(diff(previousModel.getAutoMinorVersionUpgrade(), desiredModel.getAutoMinorVersionUpgrade()))
                 .backupRetentionPeriod(diff(previousModel.getBackupRetentionPeriod(), desiredModel.getBackupRetentionPeriod()))
                 .dbInstanceClass(diff(previousModel.getDBInstanceClass(), desiredModel.getDBInstanceClass()))
@@ -448,7 +448,7 @@ public class Translator {
     ) {
         final ModifyDbInstanceRequest.Builder builder = ModifyDbInstanceRequest.builder()
                 .allowMajorVersionUpgrade(desiredModel.getAllowMajorVersionUpgrade())
-                .applyImmediately(Boolean.TRUE)
+                .applyImmediately(ResourceModelHelper.shouldApplyImmediately(desiredModel))
                 .autoMinorVersionUpgrade(diff(previousModel.getAutoMinorVersionUpgrade(), desiredModel.getAutoMinorVersionUpgrade()))
                 .backupRetentionPeriod(diff(previousModel.getBackupRetentionPeriod(), desiredModel.getBackupRetentionPeriod()))
                 .copyTagsToSnapshot(diff(previousModel.getCopyTagsToSnapshot(), desiredModel.getCopyTagsToSnapshot()))
@@ -658,7 +658,7 @@ public class Translator {
         return ModifyDbInstanceRequest.builder()
                 .dbInstanceIdentifier(desiredModel.getDBInstanceIdentifier())
                 .allocatedStorage(getAllocatedStorage(desiredModel))
-                .applyImmediately(Boolean.TRUE)
+                .applyImmediately(ResourceModelHelper.shouldApplyImmediately(desiredModel))
                 .build();
     }
 
