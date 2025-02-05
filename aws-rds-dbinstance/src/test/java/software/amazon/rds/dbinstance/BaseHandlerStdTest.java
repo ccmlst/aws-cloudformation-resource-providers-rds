@@ -34,6 +34,8 @@ import software.amazon.rds.common.logging.RequestLogger;
 import software.amazon.rds.common.request.RequestValidationException;
 import software.amazon.rds.common.request.ValidatedRequest;
 import software.amazon.rds.dbinstance.client.VersionedProxyClient;
+import software.amazon.rds.dbinstance.util.ApplyImmediately;
+import software.amazon.rds.dbinstance.util.StabilizationStatus;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -554,20 +556,21 @@ class BaseHandlerStdTest {
 
     private static Stream<Arguments> DBClusterParameterGroupTestCases() {
         return Stream.of(
-            // Test cases in the format: paramStatus, applyImmediately, expectedStabilizationState
-            // given the DBParameterGroup status and applyImmediately flag, it determines whether the resource should stabilize
-            Arguments.of(Applying.toString(), false, false),
-            Arguments.of(Applying.toString(), true, false),
-            Arguments.of(InSync.toString(), false, true),
-            Arguments.of(InSync.toString(), true, true),
-            Arguments.of(PendingReboot.toString(), false, true),
-            Arguments.of(PendingReboot.toString(), true, false)
+            // given applyImmediately enabled, the function will only stabilize on InSync
+            Arguments.of(ApplyImmediately.Enabled, InSync.toString(), StabilizationStatus.Stabilized),
+            Arguments.of(ApplyImmediately.Enabled, PendingReboot.toString(), StabilizationStatus.NotStabilized),
+            Arguments.of(ApplyImmediately.Enabled, Applying.toString(), StabilizationStatus.NotStabilized),
+
+            // given applyImmediately disabled, the function will stabilize on InSync/PendingReboot.
+            Arguments.of(ApplyImmediately.Disabled, InSync.toString(), StabilizationStatus.Stabilized),
+            Arguments.of(ApplyImmediately.Disabled, PendingReboot.toString(), StabilizationStatus.Stabilized),
+            Arguments.of(ApplyImmediately.Disabled, Applying.toString(), StabilizationStatus.NotStabilized)
         );
     }
 
     @ParameterizedTest()
     @MethodSource("DBClusterParameterGroupTestCases")
-    void isDBClusterParameterGroupStabilizedTests(String paramStatus, Boolean applyImmediately, boolean expectedStabilizationState) {
+    void isDBClusterParameterGroupStabilizedTests(ApplyImmediately applyImmediately, String paramStatus, StabilizationStatus stabilizationStatus) {
         String dbIdentifier = "testDb";
 
         var dbClusterWithMember = DBCluster.builder()
@@ -580,7 +583,7 @@ class BaseHandlerStdTest {
 
         final ResourceModel model = ResourceModel.builder()
             .dBInstanceIdentifier(dbIdentifier)
-            .applyImmediately(applyImmediately)
+            .applyImmediately(applyImmediately.isEnabled())
             .build();
 
         when(rdsProxyV12.client().describeDBClusters(any(DescribeDbClustersRequest.class)))
@@ -591,25 +594,29 @@ class BaseHandlerStdTest {
 
         boolean actual = handler.isDBClusterParameterGroupStabilized(rdsProxyV12, model);
 
-        Assertions.assertThat(actual).isEqualTo(expectedStabilizationState);
+        Assertions.assertThat(actual).isEqualTo(stabilizationStatus.isStabilized());
     }
 
     private static Stream<Arguments> DBParameterGroupTestCases() {
         return Stream.of(
             // Test cases in the format: paramStatus, applyImmediately, expectedStabilizationState
             // given the DBParameterGroup status and applyImmediately flag, it determines whether the resource should stabilize
-                Arguments.of(Applying.toString(), false, false),
-                Arguments.of(Applying.toString(), true, false),
-                Arguments.of(InSync.toString(), false, true),
-                Arguments.of(InSync.toString(), true, true),
-                Arguments.of(PendingReboot.toString(), false, true),
-                Arguments.of(PendingReboot.toString(), true, false)
+
+            // given applyImmediately enabled, the function will only stabilize on InSync
+            Arguments.of(ApplyImmediately.Enabled, InSync.toString(), StabilizationStatus.Stabilized),
+            Arguments.of(ApplyImmediately.Enabled, PendingReboot.toString(), StabilizationStatus.NotStabilized),
+            Arguments.of(ApplyImmediately.Enabled, Applying.toString(), StabilizationStatus.NotStabilized),
+
+            // given applyImmediately disabled, the function will stabilize on InSync/PendingReboot.
+            Arguments.of(ApplyImmediately.Disabled, InSync.toString(), StabilizationStatus.Stabilized),
+            Arguments.of(ApplyImmediately.Disabled, PendingReboot.toString(), StabilizationStatus.Stabilized),
+            Arguments.of(ApplyImmediately.Disabled, Applying.toString(), StabilizationStatus.NotStabilized)
         );
     }
 
     @ParameterizedTest()
     @MethodSource("DBParameterGroupTestCases")
-    void isDBParameterGroupStabilizedTests(String paramStatus, Boolean applyImmediately, boolean expectedStabilizationState) {
+    void isDBParameterGroupStabilizedTests(ApplyImmediately applyImmediately, String paramStatus, StabilizationStatus stabilizationStatus) {
         String dbIdentifier = "testDb";
 
         var dbInstance = DBInstance.builder()
@@ -621,7 +628,7 @@ class BaseHandlerStdTest {
 
         final ResourceModel model = ResourceModel.builder()
             .dBInstanceIdentifier(dbIdentifier)
-            .applyImmediately(applyImmediately)
+            .applyImmediately(applyImmediately.isEnabled())
             .build();
 
         when(rdsProxyV12.client().describeDBInstances(any(DescribeDbInstancesRequest.class)))
@@ -631,6 +638,6 @@ class BaseHandlerStdTest {
 
         boolean actual = handler.isDBParameterGroupStabilized(rdsProxyV12, model);
 
-        Assertions.assertThat(actual).isEqualTo(expectedStabilizationState);
+        Assertions.assertThat(actual).isEqualTo(stabilizationStatus.isStabilized());
     }
 }
