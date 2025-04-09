@@ -45,6 +45,9 @@ jobs:
     - name: Verify AWS::RDS::DBCluster
       run: |
         cd "${GITHUB_WORKSPACE}/aws-rds-dbcluster"
+        cat rpdk.log
+        cat aws-rds-dbcluster.json
+        mvn dependency:tree -B  | grep rpdk
         mvn clean verify --no-transfer-progress
         cat rpdk.log
     - name: Verify AWS::RDS::DBClusterParameterGroup
