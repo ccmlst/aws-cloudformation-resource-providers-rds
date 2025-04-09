@@ -47,6 +47,8 @@ jobs:
         cd "${GITHUB_WORKSPACE}/aws-rds-dbcluster"
         cat aws-rds-dbcluster.json
         mvn dependency:tree -B  | grep rpdk
+        cfn generate
+        cat /home/runner/work/aws-cloudformation-resource-providers-rds/aws-cloudformation-resource-providers-rds/aws-rds-dbcluster/target/generated-sources/rpdk/software/amazon/rds/dbcluster/HandlerWrapper.java
         mvn clean verify --no-transfer-progress
         cat rpdk.log
     - name: Verify AWS::RDS::DBClusterParameterGroup
