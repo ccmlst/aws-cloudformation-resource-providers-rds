@@ -23,7 +23,7 @@ jobs:
       with:
         python-version: 3.13
     - name: Install Python packages
-      run: pip install pre-commit cloudformation-cli cloudformation-cli-java-plugin setuptools
+      run: pip install pre-commit cloudformation-cli cloudformation-cli-java-plugin==2.1.1 setuptools
     - name: Run pre-commit
       run: pre-commit run --all-files
     - name: Verify AWS::RDS::Test::Common
@@ -45,6 +45,9 @@ jobs:
     - name: Verify AWS::RDS::DBCluster
       run: |
         cd "${GITHUB_WORKSPACE}/aws-rds-dbcluster"
+        cfn --v
+        cfn generate
+        cat /home/runner/work/aws-cloudformation-resource-providers-rds/aws-cloudformation-resource-providers-rds/aws-rds-dbcluster/target/generated-sources/rpdk/software/amazon/rds/dbcluster/HandlerWrapper.java
         mvn clean verify --no-transfer-progress
         cat rpdk.log
     - name: Verify AWS::RDS::DBClusterParameterGroup
